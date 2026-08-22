@@ -169,13 +169,56 @@ def resolve_output_target(output_path: str, fallback_image_ext: str) -> dict:
     return {"kind": "video", "file": output_path}
 
 
+INTERP_PRESETS = {
+    "ultra": {
+        "mb_size": 4,
+        "me_method": "esa",
+        "me_mode": "bilat",
+        "mc_mode": "aobmc",
+        "search_param": 64,
+        "scd": "fdiff",
+        "scd_threshold": 10.0,
+    },
+    "smooth": {
+        "mb_size": 8,
+        "me_method": "umh",
+        "me_mode": "bilat",
+        "mc_mode": "aobmc",
+        "search_param": 32,
+        "scd": "fdiff",
+        "scd_threshold": 10.0,
+    },
+    "balanced": {
+        "mb_size": 8,
+        "me_method": "hexbs",
+        "me_mode": "bilat",
+        "mc_mode": "aobmc",
+        "search_param": 32,
+        "scd": "fdiff",
+        "scd_threshold": 10.0,
+    },
+    "fast": {
+        "mb_size": 16,
+        "me_method": "epzs",
+        "me_mode": "bilat",
+        "mc_mode": "obmc",
+        "search_param": 32,
+        "scd": "fdiff",
+        "scd_threshold": 10.0,
+    },
+}
+
+
 def build_minterpolate_filter(
     target_fps: float,
-    mode: str,
-    mc_mode: str,
-    me_mode: str,
-    scd: str,
-    scd_threshold: float,
+    mode: str = "mci",
+    mc_mode: str = "aobmc",
+    me_mode: str = "bilat",
+    me_method: str = "umh",
+    mb_size: int = 8,
+    search_param: int = 32,
+    scd: str = "fdiff",
+    scd_threshold: float = 10.0,
 ) -> str:
     """Builds the minterpolate -vf filter string."""
     if mode == "mci":
@@ -185,6 +228,9 @@ def build_minterpolate_filter(
             f"mi_mode=mci:"
             f"mc_mode={mc_mode}:"
             f"me_mode={me_mode}:"
+            f"me={me_method}:"
+            f"mb_size={mb_size}:"
+            f"search_param={search_param}:"
             f"vsbmc=1:"
             f"scd={scd}:"
             f"scd_threshold={scd_threshold}"
@@ -289,12 +335,16 @@ def interpolate_video(
     src_fps: float | None = None,
     mode: str = "mci",
     mc_mode: str = "aobmc",
-    me_mode: str = "bidir",
+    me_mode: str = "bilat",
+    me_method: str = "umh",
+    mb_size: int = 8,
+    search_param: int = 32,
     crf: int = 18,
     preset: str = "medium",
     codec: str = "libx264",
     scd: str = "fdiff",
-    scd_threshold: float = 5.0,
+    scd_threshold: float = 10.0,
+    cuda: bool = False,
 ) -> bool:
     """
     Interpolates video frame rate using FFmpeg's minterpolate filter.
@@ -306,12 +356,16 @@ def interpolate_video(
         src_fps:    Optional override of the detected source frame rate (display only)
         mode: Interpolation mode ('mci' for motion compensated, 'blend' for frame blending)
         mc_mode: Motion compensation mode ('aobmc', 'obmc')
-        me_mode: Motion estimation mode ('bidir', 'bilat')
+        me_mode: Motion estimation mode ('bilat', 'bidir')
+        me_method: Motion estimation algorithm ('umh', 'hexbs', 'epzs', 'esa', etc.)
+        mb_size: Macroblock size (4 for ultra, 8 for smooth quality, 16 for fast)
+        search_param: Motion search radius parameter (default: 32)
         crf: Constant Rate Factor quality for H.264/H.265 (0-51, lower = better, 18 is visually lossless)
         preset: FFmpeg encoder speed preset ('ultrafast' to 'veryslow')
-        codec: Video encoder codec ('libx264', 'libx265', 'h264_videotoolbox')
+        codec: Video encoder codec ('libx264', 'libx265', 'h264_nvenc', 'hevc_nvenc')
         scd: Scene change detection ('fdiff' or 'none') to prevent artifacts across cuts
-        scd_threshold: Scene change threshold percentage (default: 5.0)
+        scd_threshold: Scene change threshold percentage (default: 10.0)
+        cuda: Enable NVIDIA CUDA GPU hardware decoding and NVENC hardware encoding
     """
     if not check_ffmpeg_installed():
         print("Error: FFmpeg or FFprobe not found. Please install FFmpeg first.", file=sys.stderr)
@@ -324,6 +378,12 @@ def interpolate_video(
         print(f"Error: Input file not found: {input_file}", file=sys.stderr)
         return False
 
+    if cuda:
+        if codec == "libx264":
+            codec = "h264_nvenc"
+        elif codec == "libx265":
+            codec = "hevc_nvenc"
+
     # Get input video metadata
     try:
         info = get_video_info(input_file)
@@ -335,23 +395,45 @@ def interpolate_video(
         print(f"🎞️  Source FPS:   {source_fps:.2f} fps -> Target FPS: {target_fps:g} fps"
               + (f" (detected {detected_fps:.2f}, overridden)" if src_fps is not None else ""))
         print(f"⏱️  Duration:     {format_time(duration)} ({duration:.2f}s)")
-        print(f"⚙️  Interpolator: mode={mode}, mc_mode={mc_mode}, me_mode={me_mode}")
+        print(f"⚙️  Interpolator: mode={mode}, me_mode={me_mode}, mc_mode={mc_mode}, me={me_method}, mb_size={mb_size}, search_param={search_param}, scd={scd}:{scd_threshold}")
+        if cuda:
+            print(f"⚡ GPU Acceleration: CUDA Enabled (Decoder: NVDEC, Encoder: {codec})")
     except Exception as e:
         print(f"Warning: Could not probe video duration ({e}). Progress will be limited.")
         duration = 0.0
 
     # Build the minterpolate filter string
-    filter_str = build_minterpolate_filter(target_fps, mode, mc_mode, me_mode, scd, scd_threshold)
+    filter_str = build_minterpolate_filter(
+        target_fps=target_fps,
+        mode=mode,
+        mc_mode=mc_mode,
+        me_mode=me_mode,
+        me_method=me_method,
+        mb_size=mb_size,
+        search_param=search_param,
+        scd=scd,
+        scd_threshold=scd_threshold,
+    )
 
     # Build FFmpeg command
     cmd = [
-        "ffmpeg",
-        "-y",                       # Overwrite output without asking
+        "ffmpeg", "-y",
+        "-threads", "0",
+        "-filter_threads", "0",
+    ]
+    if cuda:
+        cmd += ["-hwaccel", "cuda"]
+    cmd += [
         "-i", input_file,
         "-vf", filter_str,
         "-c:v", codec,
-        "-crf", str(crf),
-        "-preset", preset,
+    ]
+    if "nvenc" in codec:
+        cmd += ["-cq", str(crf)]
+    else:
+        cmd += ["-crf", str(crf), "-preset", preset]
+
+    cmd += [
         "-pix_fmt", "yuv420p",      # Maximum compatibility across players
         "-c:a", "copy",             # Copy audio track without re-encoding
         "-movflags", "+faststart",  # Web optimization (streamable)
@@ -375,12 +457,16 @@ def interpolate_frame_sequence(
     src_fps: float,
     mode: str = "mci",
     mc_mode: str = "aobmc",
-    me_mode: str = "bidir",
+    me_mode: str = "bilat",
+    me_method: str = "umh",
+    mb_size: int = 8,
+    search_param: int = 32,
     crf: int = 18,
     preset: str = "medium",
     codec: str = "libx264",
     scd: str = "fdiff",
-    scd_threshold: float = 5.0,
+    scd_threshold: float = 10.0,
+    cuda: bool = False,
 ) -> bool:
     """
     Interpolates a numbered frame sequence detected by detect_frame_sequence().
@@ -388,15 +474,15 @@ def interpolate_frame_sequence(
     Runs as a single FFmpeg pass (image2 demuxer -> minterpolate -> image2 muxer),
     so no lossy intermediate video is created. If the resolved output target is a
     video file, the interpolated result is encoded directly into that video.
-
-    Parameters:
-        seq:        metadata from detect_frame_sequence()
-        target:     {'kind': 'frames', 'dir', 'ext'} or {'kind': 'video', 'file'}
-        target_fps: desired output frame rate
-        src_fps:    assumed frame rate of the input sequence (frames are time-spaced at this rate)
     """
     to_video = target["kind"] == "video"
     fmt_num = lambda n: seq["num_pattern"] % n  # applies '%04d' or '%d'
+
+    if to_video and cuda:
+        if codec == "libx264":
+            codec = "h264_nvenc"
+        elif codec == "libx265":
+            codec = "hevc_nvenc"
 
     input_pattern = os.path.join(
         seq["directory"], f"{seq['prefix']}{seq['num_pattern']}{seq['extension']}"
@@ -411,9 +497,21 @@ def interpolate_frame_sequence(
     est_duration = seq["count"] / src_fps
     expected_out = round(seq["count"] * target_fps / src_fps)
     print(f"📐 Estimated out: ~{expected_out} frames ({est_duration:.2f}s @ {target_fps} fps)")
-    print(f"⚙️  Interpolator: mode={mode}, mc_mode={mc_mode}, me_mode={me_mode}")
+    print(f"⚙️  Interpolator: mode={mode}, me_mode={me_mode}, mc_mode={mc_mode}, me={me_method}, mb_size={mb_size}, search_param={search_param}, scd={scd}:{scd_threshold}")
+    if to_video and cuda:
+        print(f"⚡ GPU Acceleration: CUDA Enabled (Encoder: {codec})")
 
-    filter_str = build_minterpolate_filter(target_fps, mode, mc_mode, me_mode, scd, scd_threshold)
+    filter_str = build_minterpolate_filter(
+        target_fps=target_fps,
+        mode=mode,
+        mc_mode=mc_mode,
+        me_mode=me_mode,
+        me_method=me_method,
+        mb_size=mb_size,
+        search_param=search_param,
+        scd=scd,
+        scd_threshold=scd_threshold,
+    )
 
     # Read the sequence with an explicit frame rate and start offset
     cmd = [
@@ -431,10 +529,12 @@ def interpolate_frame_sequence(
     ]
 
     if to_video:
+        cmd += ["-c:v", codec]
+        if "nvenc" in codec:
+            cmd += ["-cq", str(crf)]
+        else:
+            cmd += ["-crf", str(crf), "-preset", preset]
         cmd += [
-            "-c:v", codec,
-            "-crf", str(crf),
-            "-preset", preset,
             "-pix_fmt", "yuv420p",
             "-an",                              # Image sequences carry no audio
             "-movflags", "+faststart",
@@ -454,9 +554,11 @@ def interpolate_frame_sequence(
         out_first = f"{seq['prefix']}{fmt_num(seq['first'])}{out_ext}"
         out_pattern = os.path.join(out_dir, f"{seq['prefix']}{seq['num_pattern']}{out_ext}")
         cmd += ["-start_number", str(seq["first"])]
-        if not out_ext:
-            # Extensionless output: force muxer + lossless PNG encoding explicitly
-            cmd += ["-f", "image2", "-c:v", "png"]
+        cmd += ["-f", "image2"]                 # Force image2 muxer for individual static frames
+        if out_ext.lower() == ".webp":
+            cmd += ["-c:v", "libwebp"]
+        elif not out_ext:
+            cmd += ["-c:v", "png"]
         cmd += ["-an", out_pattern]
         output_desc = out_dir
 
@@ -490,6 +592,24 @@ def main():
     parser.add_argument("--out-ext",
                         help="Output image extension for frame output (default: same as input frames, else .png)")
     parser.add_argument(
+        "--interp-preset",
+        choices=["ultra", "smooth", "balanced", "fast"],
+        default="smooth",
+        help="Interpolation quality preset: 'ultra' (4x4 macroblocks ESA exhaustive search), 'smooth' (8x8 UMH), "
+             "'balanced' (8x8 HEXBS), 'fast' (16x16 EPZS)",
+    )
+    parser.add_argument(
+        "--cuda",
+        action="store_true",
+        help="Enable NVIDIA CUDA GPU acceleration (NVDEC decoding & NVENC hardware encoding)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker jobs (default: auto based on available CPU cores)",
+    )
+    parser.add_argument(
         "--mode",
         choices=["mci", "blend", "dup"],
         default="mci",
@@ -498,14 +618,45 @@ def main():
     parser.add_argument(
         "--mc_mode",
         choices=["aobmc", "obmc"],
-        default="aobmc",
-        help="Motion compensation mode for MCI (default: aobmc - adaptive overlapped block)",
+        default=None,
+        help="Motion compensation mode for MCI (default: from preset, smooth/balanced=aobmc)",
     )
     parser.add_argument(
         "--me_mode",
         choices=["bidir", "bilat"],
-        default="bidir",
-        help="Motion estimation mode (default: bidir - bidirectional)",
+        default=None,
+        help="Motion estimation mode (default: from preset, bilat recommended for smooth interpolation)",
+    )
+    parser.add_argument(
+        "--me-method",
+        choices=["esa", "tss", "tdls", "ntss", "fss", "ds", "hexbs", "epzs", "umh"],
+        default=None,
+        help="Motion estimation algorithm (default: from preset, ultra=esa, smooth=umh, balanced=hexbs, fast=epzs)",
+    )
+    parser.add_argument(
+        "--mb-size",
+        type=int,
+        choices=[4, 8, 16],
+        default=None,
+        help="Macroblock size in pixels (default: from preset, 4 for ultra, 8 for smooth, 16 for fast)",
+    )
+    parser.add_argument(
+        "--search-param",
+        type=int,
+        default=None,
+        help="Motion estimation search parameter radius (default: 32, ultra=64)",
+    )
+    parser.add_argument(
+        "--scd",
+        choices=["fdiff", "none"],
+        default=None,
+        help="Scene change detection method (default: fdiff)",
+    )
+    parser.add_argument(
+        "--scd-threshold",
+        type=float,
+        default=None,
+        help="Scene change threshold percentage (default: 10.0)",
     )
     parser.add_argument("--crf", type=int, default=18, help="Constant Rate Factor (0-51, default: 18)")
     parser.add_argument(
@@ -517,6 +668,16 @@ def main():
     parser.add_argument("--codec", default="libx264", help="Video codec (default: libx264)")
 
     args = parser.parse_args()
+
+    # Resolve preset parameters with explicit CLI overrides
+    preset_defaults = INTERP_PRESETS.get(args.interp_preset, INTERP_PRESETS["smooth"])
+    mc_mode = args.mc_mode if args.mc_mode is not None else preset_defaults["mc_mode"]
+    me_mode = args.me_mode if args.me_mode is not None else preset_defaults["me_mode"]
+    me_method = args.me_method if args.me_method is not None else preset_defaults["me_method"]
+    mb_size = args.mb_size if args.mb_size is not None else preset_defaults["mb_size"]
+    search_param = args.search_param if args.search_param is not None else preset_defaults["search_param"]
+    scd = args.scd if args.scd is not None else preset_defaults["scd"]
+    scd_threshold = args.scd_threshold if args.scd_threshold is not None else preset_defaults["scd_threshold"]
 
     if not check_ffmpeg_installed():
         print("Error: FFmpeg or FFprobe not found. Please install FFmpeg first.", file=sys.stderr)
@@ -563,11 +724,17 @@ def main():
                 target_fps=args.fps,
                 src_fps=args.src_fps,
                 mode=args.mode,
-                mc_mode=args.mc_mode,
-                me_mode=args.me_mode,
+                mc_mode=mc_mode,
+                me_mode=me_mode,
+                me_method=me_method,
+                mb_size=mb_size,
+                search_param=search_param,
                 crf=args.crf,
                 preset=args.preset,
                 codec=args.codec,
+                scd=scd,
+                scd_threshold=scd_threshold,
+                cuda=args.cuda,
             )
         else:
             # ---- Classic video pipeline (video -> video) ----
@@ -588,11 +755,17 @@ def main():
                 target_fps=args.fps,
                 src_fps=args.src_fps,
                 mode=args.mode,
-                mc_mode=args.mc_mode,
-                me_mode=args.me_mode,
+                mc_mode=mc_mode,
+                me_mode=me_mode,
+                me_method=me_method,
+                mb_size=mb_size,
+                search_param=search_param,
                 crf=args.crf,
                 preset=args.preset,
                 codec=args.codec,
+                scd=scd,
+                scd_threshold=scd_threshold,
+                cuda=args.cuda,
             )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
