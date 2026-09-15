@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Video and test media
+*.mov
+*.mp4
+*.mkv
+*.avi
+*.webm
+
+# Temporary frame sequence output folders
+*_frames/
+*_frames_out/
+*_frames_out*/
+frames_in/
+frames_out/
